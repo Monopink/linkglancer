@@ -12,6 +12,7 @@ from link_glancer.tasks.models import (
     BrowserConfig,
     BrowserProfile,
     CreatorCollectionRecovery,
+    MachineScreeningRecord,
     ReviewDraft,
     ReviewField,
     ReviewOption,
@@ -21,6 +22,17 @@ from link_glancer.tasks.models import (
     TaskItem,
     TaskSnapshot,
     TaskSummary,
+)
+from link_glancer.tasks.screening import (
+    ensure_machine_screening_field,
+    is_machine_screening_field,
+    machine_screening_field,
+    matches_machine_screening_scope,
+    matches_screening_scope,
+    normalize_task_range_selection,
+    screen_value_for_result,
+    screening_fields,
+    screening_scope_labels,
 )
 from link_glancer.tasks.serialization import (
     review_field_from_dict,
@@ -345,6 +357,9 @@ class TaskApplicationService:
                 enabled_review_field_ids=[field.field_id for field in library],
                 shortcuts=shortcuts,
                 export_fields=[],
+                manual_review_scope=["screen_passed", "screen_failed", "screen_unresolved"],
+                export_scope=["screen_passed", "screen_failed", "screen_unresolved"],
+                enrichment_scope=["screen_passed", "screen_failed", "screen_unresolved"],
             )
             return source_path, snapshot
 
@@ -367,12 +382,17 @@ class TaskApplicationService:
         if not isinstance(raw, list):
             return []
         fields = [review_field_from_dict(item) for item in raw if isinstance(item, dict)]
+        fields = [field for field in fields if not is_machine_screening_field(field)]
         if fields:
             self.validate_review_fields(fields)
         return fields
 
     def save_review_field_library(self, review_fields: list[ReviewField]) -> None:
-        normalized = self.merge_review_fields([], review_fields)
+        normalized = [
+            field
+            for field in self.merge_review_fields([], review_fields)
+            if not is_machine_screening_field(field)
+        ]
         if normalized:
             self.validate_review_fields(normalized)
         payload = [review_field_to_dict(field) for field in normalized]
@@ -424,6 +444,9 @@ class TaskApplicationService:
             enabled_review_field_ids=list(normalized_snapshot.enabled_review_field_ids),
             shortcuts=ReviewShortcutConfig(),
             export_fields=list(normalized_snapshot.export_fields),
+            manual_review_scope=normalized_snapshot.manual_review_scope,
+            export_scope=normalized_snapshot.export_scope,
+            enrichment_scope=normalized_snapshot.enrichment_scope,
         )
         self._tasks.save_app_setting(
             LAST_TASK_DEFAULTS_KEY,
@@ -458,6 +481,9 @@ class TaskApplicationService:
                 enabled_review_field_ids=[],
                 shortcuts=self.load_task_shortcut_defaults(),
                 export_fields=list(task_snapshot.export_fields),
+                manual_review_scope=task_snapshot.manual_review_scope,
+                export_scope=task_snapshot.export_scope,
+                enrichment_scope=task_snapshot.enrichment_scope,
             )
             current_source_path = source_path
 
@@ -478,6 +504,9 @@ class TaskApplicationService:
             enabled_review_field_ids=merged_enabled_ids,
             shortcuts=self.load_task_shortcut_defaults(),
             export_fields=list(task_snapshot.export_fields),
+            manual_review_scope=task_snapshot.manual_review_scope,
+            export_scope=task_snapshot.export_scope,
+            enrichment_scope=task_snapshot.enrichment_scope,
         )
         self.save_task_creation_defaults(
             source_path=source_path or current_source_path,
@@ -499,12 +528,10 @@ class TaskApplicationService:
             ReviewField(
                 field_id="validity",
                 label="是否可用",
-                field_type="single_select",
+                field_type="screen",
                 required=True,
-                options=[
-                    ReviewOption(value="是", shortcut="1"),
-                    ReviewOption(value="否", shortcut="2"),
-                ],
+                screen_pass_value="通过",
+                screen_fail_value="不通过",
             ),
             ReviewField(
                 field_id="quality",
@@ -565,17 +592,94 @@ class TaskApplicationService:
                 "top_follower_gender",
                 "url",
             ],
+            manual_review_scope=["screen_passed", "screen_failed", "screen_unresolved"],
+            export_scope=["screen_passed", "screen_failed", "screen_unresolved"],
+            enrichment_scope=["screen_passed"],
         )
 
     def list_buffer_items(self, task: TaskDetail) -> list[TaskItem]:
-        return self._tasks.list_items_in_range(
-            task_id=task.task_id,
-            start_index=task.current_task_index,
-            limit=task.task_snapshot.open_tab_count,
-        )
+        eligible_items = self.manual_scope_items(task)
+        return [item for item in eligible_items if item.task_index >= task.current_task_index][
+            : task.task_snapshot.open_tab_count
+        ]
 
     def list_all_items(self, task_id: int) -> list[TaskItem]:
         return self._tasks.list_all_items(task_id)
+
+    def manual_scope_items(self, task: TaskDetail) -> list[TaskItem]:
+        items = self.list_all_items(task.task_id)
+        reviews = self.list_reviews(task.task_id)
+        machine_results = self.list_machine_screening_results(task.task_id)
+        return [
+            item
+            for item in items
+            if matches_machine_screening_scope(
+                task.task_snapshot,
+                self.merged_review_data(
+                    task.task_snapshot,
+                    review_data=(
+                        reviews.get(item.task_item_id).review_data
+                        if reviews.get(item.task_item_id) is not None
+                        else {}
+                    ),
+                    machine_screening=machine_results.get(item.task_item_id),
+                ),
+                task.task_snapshot.manual_review_scope,
+            )
+        ]
+
+    def enrichment_scope_items(self, task_id: int) -> list[TaskItem]:
+        task = self.load_task(task_id)
+        items = self.list_all_items(task_id)
+        reviews = self.list_reviews(task_id)
+        machine_results = self.list_machine_screening_results(task_id)
+        return [
+            item
+            for item in items
+            if matches_screening_scope(
+                task.task_snapshot,
+                self.merged_review_data(
+                    task.task_snapshot,
+                    review_data=(
+                        reviews.get(item.task_item_id).review_data
+                        if reviews.get(item.task_item_id) is not None
+                        else {}
+                    ),
+                    machine_screening=machine_results.get(item.task_item_id),
+                ),
+                task.task_snapshot.enrichment_scope,
+            )
+        ]
+
+    def manual_scope_indexes(self, task: TaskDetail) -> list[int]:
+        return [item.task_index for item in self.manual_scope_items(task)]
+
+    def manual_scope_total_count(self, task: TaskDetail) -> int:
+        return len(self.manual_scope_items(task))
+
+    def manual_scope_completed_count(self, task: TaskDetail) -> int:
+        reviews = self.list_reviews(task.task_id)
+        return sum(1 for item in self.manual_scope_items(task) if item.task_item_id in reviews)
+
+    def has_manual_scope_items(self, task: TaskDetail) -> bool:
+        return self.manual_scope_total_count(task) > 0
+
+    def align_manual_scope_pointer(self, task_id: int) -> TaskDetail:
+        task = self.load_task(task_id)
+        scope_indexes = self.manual_scope_indexes(task)
+        if not scope_indexes:
+            return task
+        if task.current_task_index in scope_indexes:
+            if task.viewing_task_index in scope_indexes:
+                return task
+            return self.set_viewing_task_index(task_id=task_id, task_index=task.current_task_index)
+        next_index = next(
+            (index for index in scope_indexes if index >= task.current_task_index),
+            None,
+        )
+        if next_index is None:
+            next_index = scope_indexes[-1]
+        return self.jump_to_task_index(task_id=task_id, task_index=next_index)
 
     def load_item_at(self, *, task_id: int, task_index: int) -> TaskItem | None:
         items = self._tasks.list_items_in_range(task_id=task_id, start_index=task_index, limit=1)
@@ -583,6 +687,29 @@ class TaskApplicationService:
 
     def list_reviews(self, task_id: int) -> dict[int, ReviewRecord]:
         return self._tasks.list_reviews(task_id)
+
+    def list_machine_screening_results(self, task_id: int) -> dict[int, MachineScreeningRecord]:
+        return self._tasks.list_machine_screening_results(task_id)
+
+    def has_machine_screening_results(self, task_id: int) -> bool:
+        return self._tasks.has_machine_screening_results(task_id)
+
+    def merged_review_data(
+        self,
+        task_snapshot: TaskSnapshot,
+        *,
+        review_data: dict[str, object] | None = None,
+        machine_screening: MachineScreeningRecord | None = None,
+    ) -> dict[str, object]:
+        merged = dict(review_data or {})
+        field = machine_screening_field(task_snapshot)
+        if field is None or machine_screening is None:
+            return merged
+        if field.field_id not in merged:
+            value = screen_value_for_result(field, machine_screening.result_code)
+            if value is not None:
+                merged[field.field_id] = value
+        return merged
 
     def find_previous_reviewed_index(self, *, task_id: int, before_task_index: int) -> int | None:
         return self._tasks.find_previous_reviewed_index(
@@ -623,6 +750,29 @@ class TaskApplicationService:
             review_data=review_data,
             advance_pointer=advance_pointer,
         )
+        task = self.load_task(task_id)
+        if advance_pointer:
+            task = self.align_manual_scope_pointer(task_id)
+        return task
+
+    def save_machine_screening_result(
+        self,
+        *,
+        task_id: int,
+        task_index: int,
+        result_code: str,
+        details: dict[str, object] | None = None,
+        error_message: str | None = None,
+        screened_at: str | None = None,
+    ) -> TaskDetail:
+        self._tasks.save_machine_screening_result(
+            task_id=task_id,
+            task_index=task_index,
+            result_code=result_code,
+            details=details,
+            error_message=error_message,
+            screened_at=screened_at,
+        )
         return self.load_task(task_id)
 
     def save_review_draft(
@@ -641,7 +791,7 @@ class TaskApplicationService:
 
     def skip_review(self, *, task_id: int, task_index: int) -> TaskDetail:
         self._tasks.skip_review(task_id=task_id, task_index=task_index)
-        return self.load_task(task_id)
+        return self.align_manual_scope_pointer(task_id)
 
     def update_task_item_data(
         self,
@@ -667,7 +817,7 @@ class TaskApplicationService:
 
     def mark_task_in_progress(self, task_id: int) -> TaskDetail:
         self._tasks.mark_task_in_progress(task_id)
-        return self.load_task(task_id)
+        return self.align_manual_scope_pointer(task_id)
 
     def export_task(self, *, task_id: int, destination_dir: Path | None = None) -> Path:
         return self._tasks.export_task(task_id=task_id, destination_dir=destination_dir)
@@ -713,9 +863,25 @@ class TaskApplicationService:
                 raise ValueError(f"检查项结果列名重复：{field.field_id}")
             if not field.label.strip():
                 raise ValueError("检查项问题标题不能为空。")
+            if field.field_type == "screen":
+                if field.options:
+                    raise ValueError(f"筛选类型检查项不能配置普通选项：{field.label}")
+                if not field.screen_pass_value.strip() or not field.screen_fail_value.strip():
+                    raise ValueError(f"筛选类型检查项必须配置通过/不通过展示值：{field.label}")
+                if field.screen_pass_value == field.screen_fail_value:
+                    raise ValueError(f"筛选类型检查项的通过/不通过展示值不能相同：{field.label}")
+            elif field.source == "machine":
+                raise ValueError(f"仅筛选类型检查项可设置为机器来源：{field.label}")
             if field.field_type in {"single_select", "multi_select"} and not field.options:
                 raise ValueError(f"选择类型的检查项必须配置选项：{field.label}")
             seen.add(field.field_id)
+        machine_screen_fields = [
+            field
+            for field in review_fields
+            if field.field_type == "screen" and field.source == "machine"
+        ]
+        if len(machine_screen_fields) > 1:
+            raise ValueError("当前仅支持一个机器初筛检查项。")
 
     def validate_enabled_review_fields(self, task_snapshot: TaskSnapshot) -> None:
         if not task_snapshot.enabled_review_field_ids:
@@ -760,6 +926,18 @@ class TaskApplicationService:
         }
         return [field for field in task_snapshot.review_fields if field.field_id in enabled_ids]
 
+    def visible_review_fields(self, task: TaskDetail) -> list[ReviewField]:
+        fields = self.enabled_review_fields(task.task_snapshot)
+        if self.has_machine_screening_results(task.task_id):
+            return fields
+        return [field for field in fields if not is_machine_screening_field(field)]
+
+    def machine_screening_fields(self, task_snapshot: TaskSnapshot) -> list[ReviewField]:
+        return [field for field in screening_fields(task_snapshot) if field.source == "machine"]
+
+    def has_machine_screening_fields(self, task_snapshot: TaskSnapshot) -> bool:
+        return bool(self.machine_screening_fields(task_snapshot))
+
     def task_display_field_names(
         self, task: TaskDetail, items: list[TaskItem] | None = None
     ) -> list[str]:
@@ -780,15 +958,36 @@ class TaskApplicationService:
         self, task: TaskDetail, items: list[TaskItem] | None = None
     ) -> list[str]:
         items = items if items is not None else self.list_all_items(task.task_id)
-        return resolve_export_fields(
+        field_names = resolve_export_fields(
             task.task_snapshot.review_fields,
             task.task_snapshot.enabled_review_field_ids,
             items,
             task.task_snapshot.export_fields,
         )
+        if self.has_machine_screening_results(task.task_id):
+            return field_names
+        machine_field = machine_screening_field(task.task_snapshot)
+        if machine_field is None:
+            return field_names
+        return [field_name for field_name in field_names if field_name != machine_field.field_id]
+
+    def range_scope_label(self, scope: object, *, mode: str = "overall") -> str:
+        normalized = normalize_task_range_selection(scope)
+        if mode == "manual":
+            labels = {
+                "screen_passed": "初筛通过",
+                "screen_failed": "初筛不通过",
+                "screen_unresolved": "未初筛",
+            }
+            if len(normalized) == 3:
+                return "全部"
+            return "、".join(labels[item] for item in normalized)
+        return screening_scope_labels(normalized)
 
     def normalize_task_snapshot(self, task_snapshot: TaskSnapshot) -> TaskSnapshot:
-        review_fields = self.merge_review_fields([], task_snapshot.review_fields)
+        review_fields = ensure_machine_screening_field(
+            self.merge_review_fields([], task_snapshot.review_fields)
+        )
         enabled_review_field_ids = self.normalize_enabled_review_field_ids(
             review_fields,
             task_snapshot.enabled_review_field_ids,
@@ -805,6 +1004,9 @@ class TaskApplicationService:
             enabled_review_field_ids=enabled_review_field_ids,
             shortcuts=task_snapshot.shortcuts,
             export_fields=list(task_snapshot.export_fields),
+            manual_review_scope=normalize_task_range_selection(task_snapshot.manual_review_scope),
+            export_scope=normalize_task_range_selection(task_snapshot.export_scope),
+            enrichment_scope=normalize_task_range_selection(task_snapshot.enrichment_scope),
         )
 
     def merge_review_fields(
@@ -832,10 +1034,17 @@ class TaskApplicationService:
         enabled_review_field_ids: list[str],
     ) -> list[str]:
         known_ids = [field.field_id for field in review_fields]
+        machine_field = next(
+            (field for field in review_fields if is_machine_screening_field(field)),
+            None,
+        )
         if not enabled_review_field_ids:
             return list(known_ids)
         enabled_set = {field_id for field_id in enabled_review_field_ids}
-        return [field_id for field_id in known_ids if field_id in enabled_set]
+        normalized_ids = [field_id for field_id in known_ids if field_id in enabled_set]
+        if machine_field is not None and machine_field.field_id not in normalized_ids:
+            normalized_ids.append(machine_field.field_id)
+        return normalized_ids
 
     def _available_task_columns(self, items: list[TaskItem]) -> set[str]:
         return {

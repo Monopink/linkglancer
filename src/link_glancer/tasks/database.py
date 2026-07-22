@@ -14,6 +14,7 @@ from link_glancer.tasks.models import (
     BrowserProfile,
     CreatorCollectionRecovery,
     CreatorCollectionSessionSummary,
+    MachineScreeningRecord,
     ReviewDraft,
     ReviewRecord,
     TaskDetail,
@@ -22,14 +23,16 @@ from link_glancer.tasks.models import (
     TaskStatus,
     TaskSummary,
 )
+from link_glancer.tasks.screening import build_machine_screening_field
 from link_glancer.tasks.serialization import (
     browser_config_from_dict,
     browser_config_to_dict,
+    review_field_to_dict,
     task_snapshot_from_dict,
     task_snapshot_to_dict,
 )
 
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 9
 
 
 @dataclass(frozen=True)
@@ -711,6 +714,46 @@ def list_reviews(database_path: Path, task_id: int) -> dict[int, ReviewRecord]:
         return {int(row["task_item_id"]): _review_from_row(row) for row in rows}
 
 
+def list_machine_screening_results(
+    database_path: Path,
+    task_id: int,
+) -> dict[int, MachineScreeningRecord]:
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            """
+            SELECT
+                m.task_item_id,
+                m.result_code,
+                m.details_json,
+                m.error_message,
+                m.screened_at,
+                m.updated_at
+            FROM machine_screening_results m
+            JOIN task_items i ON i.id = m.task_item_id
+            WHERE i.task_id = ?
+            ORDER BY i.task_index
+            """,
+            (task_id,),
+        ).fetchall()
+        return {int(row["task_item_id"]): _machine_screening_record_from_row(row) for row in rows}
+
+
+def has_machine_screening_results(database_path: Path, task_id: int) -> bool:
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT 1
+            FROM machine_screening_results m
+            JOIN task_items i ON i.id = m.task_item_id
+            WHERE i.task_id = ?
+            LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+        return row is not None
+
+
 def find_previous_reviewed_index(
     database_path: Path, *, task_id: int, before_task_index: int
 ) -> int | None:
@@ -799,6 +842,46 @@ def save_review(
             )
         else:
             connection.execute("UPDATE tasks SET updated_at = ? WHERE id = ?", (now, task_id))
+
+
+def save_machine_screening_result(
+    database_path: Path,
+    *,
+    task_id: int,
+    task_index: int,
+    result_code: str,
+    details: dict[str, object] | None = None,
+    error_message: str | None = None,
+    screened_at: str | None = None,
+) -> None:
+    now = _now_iso()
+    with sqlite3.connect(database_path) as connection:
+        item = load_task_item_by_index(connection, task_id, task_index)
+        if item is None:
+            raise ValueError(f"Task item not found: task_id={task_id}, task_index={task_index}")
+        connection.execute(
+            """
+            INSERT INTO machine_screening_results (
+                task_item_id, result_code, details_json, error_message, screened_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(task_item_id) DO UPDATE SET
+                result_code = excluded.result_code,
+                details_json = excluded.details_json,
+                error_message = excluded.error_message,
+                screened_at = excluded.screened_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                item.task_item_id,
+                result_code,
+                _json(details or {}),
+                error_message,
+                screened_at or now,
+                now,
+            ),
+        )
+        connection.execute("UPDATE tasks SET updated_at = ? WHERE id = ?", (now, task_id))
 
 
 def skip_review(database_path: Path, *, task_id: int, task_index: int) -> None:
@@ -1091,11 +1174,6 @@ def _table_names(connection: sqlite3.Connection) -> set[str]:
     return {str(row[0]) for row in rows}
 
 
-def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
-    rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
-    return {str(row[1]) for row in rows}
-
-
 def _schema_version(connection: sqlite3.Connection) -> int | None:
     try:
         row = connection.execute(
@@ -1180,6 +1258,16 @@ def _ensure_schema_objects(connection: sqlite3.Connection) -> None:
             FOREIGN KEY(task_item_id) REFERENCES task_items(id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS machine_screening_results (
+            task_item_id INTEGER PRIMARY KEY,
+            result_code TEXT NOT NULL,
+            details_json TEXT NOT NULL,
+            error_message TEXT,
+            screened_at TEXT,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(task_item_id) REFERENCES task_items(id) ON DELETE CASCADE
+        );
+
         CREATE TABLE IF NOT EXISTS app_settings (
             key TEXT PRIMARY KEY,
             value_json TEXT NOT NULL,
@@ -1224,9 +1312,15 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
         return
     if schema_version == 5:
         _migrate_schema_v5_to_v6(connection)
-        return
+        schema_version = 6
     if schema_version == 6:
         _migrate_schema_v6_to_v7(connection)
+        schema_version = 7
+    if schema_version == 7:
+        _migrate_schema_v7_to_v8(connection)
+        schema_version = 8
+    if schema_version == 8:
+        _migrate_schema_v8_to_v9(connection)
         return
     raise RuntimeError(
         f"不支持从 schema 版本 {schema_version} 自动迁移到 {CURRENT_SCHEMA_VERSION}。"
@@ -1234,8 +1328,8 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
 
 
 def _migrate_schema_v5_to_v6(connection: sqlite3.Connection) -> None:
-    # v6 only adds creator collector temporary-session tables; existing task data stays intact.
     _ensure_schema_objects(connection)
+    _set_app_setting(connection, "schema_version", 6)
 
 
 def _migrate_schema_v6_to_v7(connection: sqlite3.Connection) -> None:
@@ -1263,6 +1357,106 @@ def _migrate_schema_v6_to_v7(connection: sqlite3.Connection) -> None:
         """
     )
     _ensure_schema_objects(connection)
+    _set_app_setting(connection, "schema_version", 7)
+
+
+def _migrate_schema_v7_to_v8(connection: sqlite3.Connection) -> None:
+    _ensure_schema_objects(connection)
+    _migrate_task_snapshot_payloads(connection)
+    _migrate_app_settings_payloads(connection)
+    _set_app_setting(connection, "schema_version", 8)
+
+
+def _migrate_schema_v8_to_v9(connection: sqlite3.Connection) -> None:
+    _ensure_schema_objects(connection)
+    _set_app_setting(connection, "schema_version", 9)
+
+
+def _migrate_task_snapshot_payloads(connection: sqlite3.Connection) -> None:
+    rows = connection.execute("SELECT id, task_snapshot_json FROM tasks").fetchall()
+    for task_id, raw_payload in rows:
+        payload = json.loads(str(raw_payload))
+        if not isinstance(payload, dict):
+            continue
+        normalized = _normalize_task_snapshot_payload(payload)
+        connection.execute(
+            "UPDATE tasks SET task_snapshot_json = ?, updated_at = ? WHERE id = ?",
+            (_json(normalized), _now_iso(), int(task_id)),
+        )
+
+
+def _migrate_app_settings_payloads(connection: sqlite3.Connection) -> None:
+    review_field_library = load_app_setting_from_connection(connection, "review_field_library")
+    if isinstance(review_field_library, list):
+        normalized_library = [
+            _normalize_review_field_payload(item)
+            for item in review_field_library
+            if isinstance(item, dict)
+        ]
+        _set_app_setting(connection, "review_field_library", normalized_library)
+
+    last_defaults = load_app_setting_from_connection(connection, "last_task_creation_defaults")
+    if isinstance(last_defaults, dict):
+        snapshot = last_defaults.get("task_snapshot")
+        if isinstance(snapshot, dict):
+            last_defaults["task_snapshot"] = _normalize_task_snapshot_payload(snapshot)
+            _set_app_setting(connection, "last_task_creation_defaults", last_defaults)
+
+
+def _normalize_task_snapshot_payload(payload: dict[str, object]) -> dict[str, object]:
+    normalized = dict(payload)
+    review_fields = normalized.get("review_fields")
+    if isinstance(review_fields, list):
+        normalized_review_fields = [
+            _normalize_review_field_payload(item)
+            for item in review_fields
+            if isinstance(item, dict)
+        ]
+        if not any(
+            item.get("type") == "screen" and item.get("source") == "machine"
+            for item in normalized_review_fields
+        ):
+            normalized_review_fields.append(
+                _normalize_review_field_payload(
+                    review_field_to_dict(build_machine_screening_field())
+                )
+            )
+        normalized["review_fields"] = normalized_review_fields
+    normalized.setdefault(
+        "manual_review_scope", ["screen_passed", "screen_failed", "screen_unresolved"]
+    )
+    normalized.setdefault("export_scope", ["screen_passed", "screen_failed", "screen_unresolved"])
+    normalized.setdefault(
+        "enrichment_scope", ["screen_passed", "screen_failed", "screen_unresolved"]
+    )
+    return normalized
+
+
+def _normalize_review_field_payload(payload: dict[str, object]) -> dict[str, object]:
+    normalized = dict(payload)
+    normalized.setdefault("field", str(normalized.get("id", "")))
+    normalized.setdefault("screen_pass_value", "通过")
+    normalized.setdefault("screen_fail_value", "不通过")
+    normalized.setdefault("source", "manual")
+    return normalized
+
+
+def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
+    rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {str(row[1]) for row in rows}
+
+
+def load_app_setting_from_connection(connection: sqlite3.Connection, key: str) -> object | None:
+    row = connection.execute(
+        "SELECT value_json FROM app_settings WHERE key = ?",
+        (key,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        return json.loads(str(row[0]))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 
 def load_task_item_by_index(
@@ -1327,6 +1521,17 @@ def _review_from_row(row: sqlite3.Row) -> ReviewRecord:
         review_data=json.loads(row["review_data_json"]),
         review_status=str(row["review_status"]),
         reviewed_at=str(row["reviewed_at"]) if row["reviewed_at"] else None,
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _machine_screening_record_from_row(row: sqlite3.Row) -> MachineScreeningRecord:
+    return MachineScreeningRecord(
+        task_item_id=int(row["task_item_id"]),
+        result_code=str(row["result_code"]),  # type: ignore[arg-type]
+        details=json.loads(row["details_json"]),
+        error_message=str(row["error_message"]) if row["error_message"] else None,
+        screened_at=str(row["screened_at"]) if row["screened_at"] else None,
         updated_at=str(row["updated_at"]),
     )
 

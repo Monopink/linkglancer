@@ -9,6 +9,7 @@ from link_glancer.tasks.models import (
     BrowserProfile,
     CreatorCollectionRecovery,
     CreatorCollectionSessionSummary,
+    MachineScreeningRecord,
     ReviewDraft,
     ReviewRecord,
     TaskDetail,
@@ -65,6 +66,12 @@ class TaskRepository:
     def list_reviews(self, task_id: int) -> dict[int, ReviewRecord]:
         return database.list_reviews(self.database_path, task_id)
 
+    def list_machine_screening_results(self, task_id: int) -> dict[int, MachineScreeningRecord]:
+        return database.list_machine_screening_results(self.database_path, task_id)
+
+    def has_machine_screening_results(self, task_id: int) -> bool:
+        return database.has_machine_screening_results(self.database_path, task_id)
+
     def find_previous_reviewed_index(self, *, task_id: int, before_task_index: int) -> int | None:
         return database.find_previous_reviewed_index(
             self.database_path,
@@ -114,6 +121,26 @@ class TaskRepository:
             task_index=task_index,
             review_data=review_data,
             advance_pointer=advance_pointer,
+        )
+
+    def save_machine_screening_result(
+        self,
+        *,
+        task_id: int,
+        task_index: int,
+        result_code: str,
+        details: dict[str, object] | None = None,
+        error_message: str | None = None,
+        screened_at: str | None = None,
+    ) -> None:
+        database.save_machine_screening_result(
+            self.database_path,
+            task_id=task_id,
+            task_index=task_index,
+            result_code=result_code,
+            details=details,
+            error_message=error_message,
+            screened_at=screened_at,
         )
 
     def save_review_draft(
