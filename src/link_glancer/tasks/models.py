@@ -11,6 +11,7 @@ TaskRangeScope = Literal["screen_passed", "screen_failed", "screen_unresolved"]
 TaskRangeSelection = list[TaskRangeScope]
 ReviewFieldSource = Literal["manual", "machine"]
 MachineScreeningResultCode = Literal["screen_passed", "screen_failed", "screen_unresolved"]
+MachineScreeningMetricType = Literal["sum", "avg", "median"]
 
 
 @dataclass(slots=True)
@@ -58,6 +59,13 @@ class BrowserConfig:
 
 
 @dataclass(slots=True)
+class MachineScreeningConfig:
+    top_video_count: int = 10
+    metric_type: MachineScreeningMetricType = "avg"
+    play_count_threshold: int = 1000
+
+
+@dataclass(slots=True)
 class TaskSnapshot:
     sheet_name: str
     header_row: int
@@ -79,6 +87,7 @@ class TaskSnapshot:
     enrichment_scope: TaskRangeSelection = field(
         default_factory=lambda: ["screen_passed", "screen_failed", "screen_unresolved"]
     )
+    machine_screening_config: MachineScreeningConfig = field(default_factory=MachineScreeningConfig)
 
 
 @dataclass(slots=True)

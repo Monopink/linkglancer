@@ -750,6 +750,8 @@ class MainWindow(QMainWindow):
             task=self.task,
             parent=self,
         )
+        if not dialog.start_with_confirmation():
+            return
         dialog.exec()
         self._refresh_task_page()
 

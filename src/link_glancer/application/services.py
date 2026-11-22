@@ -26,6 +26,7 @@ from link_glancer.tasks.models import (
 from link_glancer.tasks.screening import (
     ensure_machine_screening_field,
     is_machine_screening_field,
+    machine_remark_field,
     machine_screening_field,
     matches_machine_screening_scope,
     matches_screening_scope,
@@ -97,6 +98,7 @@ class TaskApplicationService:
         enabled_review_fields = self.enabled_review_fields(task_snapshot)
         self.validate_review_fields(task_snapshot.review_fields)
         self.validate_enabled_review_fields(task_snapshot)
+        self.validate_machine_screening_config(task_snapshot)
         self.validate_shortcuts(
             task_snapshot.shortcuts,
             enabled_review_fields,
@@ -302,6 +304,7 @@ class TaskApplicationService:
         normalized_snapshot = self.normalize_task_snapshot(task_snapshot)
         self.validate_review_fields(normalized_snapshot.review_fields)
         self.validate_enabled_review_fields(normalized_snapshot)
+        self.validate_machine_screening_config(normalized_snapshot)
         self.validate_shortcuts(
             normalized_snapshot.shortcuts,
             self.enabled_review_fields(normalized_snapshot),
@@ -703,12 +706,19 @@ class TaskApplicationService:
     ) -> dict[str, object]:
         merged = dict(review_data or {})
         field = machine_screening_field(task_snapshot)
-        if field is None or machine_screening is None:
-            return merged
-        if field.field_id not in merged:
-            value = screen_value_for_result(field, machine_screening.result_code)
-            if value is not None:
-                merged[field.field_id] = value
+        if machine_screening is not None:
+            if field is not None and field.field_id not in merged:
+                value = screen_value_for_result(field, machine_screening.result_code)
+                if value is not None:
+                    merged[field.field_id] = value
+            remark_field = machine_remark_field(task_snapshot)
+            machine_note = str(machine_screening.details.get("machine_note") or "").strip()
+            if (
+                remark_field is not None
+                and machine_note
+                and not str(merged.get(remark_field.field_id) or "").strip()
+            ):
+                merged[remark_field.field_id] = machine_note
         return merged
 
     def find_previous_reviewed_index(self, *, task_id: int, before_task_index: int) -> int | None:
@@ -890,6 +900,15 @@ class TaskApplicationService:
         for field_id in task_snapshot.enabled_review_field_ids:
             if field_id not in field_ids:
                 raise ValueError(f"启用的检查项不存在：{field_id}")
+
+    def validate_machine_screening_config(self, task_snapshot: TaskSnapshot) -> None:
+        config = task_snapshot.machine_screening_config
+        if config.top_video_count <= 0:
+            raise ValueError("自动初筛配置无效：前视频数量必须大于 0。")
+        if config.play_count_threshold < 0:
+            raise ValueError("自动初筛配置无效：播放量阈值不能小于 0。")
+        if config.metric_type not in {"sum", "avg", "median"}:
+            raise ValueError("自动初筛配置无效：播放量聚合方式不支持。")
 
     def validate_shortcuts(
         self,

@@ -57,6 +57,18 @@ def machine_screening_field(task_snapshot: TaskSnapshot) -> ReviewField | None:
     )
 
 
+def machine_remark_field(task_snapshot: TaskSnapshot) -> ReviewField | None:
+    enabled_ids = set(task_snapshot.enabled_review_field_ids or [])
+    for field in task_snapshot.review_fields:
+        if enabled_ids and field.field_id not in enabled_ids:
+            continue
+        if field.field_type != "text":
+            continue
+        if field.field_id in {"remark", "note"}:
+            return field
+    return None
+
+
 def normalize_machine_screening_result_code(
     value: object,
 ) -> MachineScreeningResultCode | None:

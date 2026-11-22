@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 from link_glancer.application.services import TaskApplicationService
 from link_glancer.tasks.models import (
     BrowserConfig,
+    MachineScreeningConfig,
     ReviewField,
     ReviewOption,
     ReviewShortcutConfig,
@@ -65,6 +66,11 @@ OVERALL_RANGE_SCOPE_OPTIONS: list[tuple[str, TaskRangeScope]] = [
     ("整体通过", "screen_passed"),
     ("整体不通过", "screen_failed"),
     ("未筛选", "screen_unresolved"),
+]
+MACHINE_SCREENING_METRIC_OPTIONS = [
+    ("总和", "sum"),
+    ("平均值", "avg"),
+    ("中位数", "median"),
 ]
 
 ROW_ORIGIN_ROLE = Qt.ItemDataRole.UserRole + 1
@@ -300,6 +306,15 @@ class TaskCreationDialog(QDialog):
         self._manual_scope_widget.set_value(default_scopes)
         self._export_scope_widget.set_value(default_scopes)
         self._enrichment_scope_widget.set_value(default_scopes)
+        self._machine_top_video_spin = QSpinBox()
+        self._machine_top_video_spin.setRange(1, 100)
+        self._machine_top_video_spin.setValue(10)
+        self._machine_metric_combo = QComboBox()
+        for label, value in MACHINE_SCREENING_METRIC_OPTIONS:
+            self._machine_metric_combo.addItem(label, value)
+        self._machine_threshold_spin = QSpinBox()
+        self._machine_threshold_spin.setRange(0, 2_000_000_000)
+        self._machine_threshold_spin.setValue(1000)
 
         form.addRow("Excel 文件", source_widget)
         form.addRow("确认页 URL", self._expanding_form_field(self._confirm_url_edit))
@@ -336,6 +351,18 @@ class TaskCreationDialog(QDialog):
         form.addRow(
             "补充采集范围",
             self._expanding_form_field(self._enrichment_scope_widget),
+        )
+        form.addRow(
+            "初筛视频数",
+            self._bounded_form_field(self._machine_top_video_spin, FORM_FIELD_COMPACT_WIDTH),
+        )
+        form.addRow(
+            "初筛播放量",
+            self._bounded_form_field(self._machine_metric_combo, FORM_FIELD_COMPACT_WIDTH),
+        )
+        form.addRow(
+            "初筛阈值",
+            self._bounded_form_field(self._machine_threshold_spin, FORM_FIELD_COMPACT_WIDTH),
         )
         root.addLayout(form)
 
@@ -476,6 +503,14 @@ class TaskCreationDialog(QDialog):
         self._manual_scope_widget.set_value(snapshot.manual_review_scope)
         self._export_scope_widget.set_value(snapshot.export_scope)
         self._enrichment_scope_widget.set_value(snapshot.enrichment_scope)
+        self._machine_top_video_spin.setValue(snapshot.machine_screening_config.top_video_count)
+        self._set_combo_data(
+            self._machine_metric_combo,
+            snapshot.machine_screening_config.metric_type,
+        )
+        self._machine_threshold_spin.setValue(
+            snapshot.machine_screening_config.play_count_threshold
+        )
         self._submit_shortcut_edit.setKeySequence(QKeySequence(snapshot.shortcuts.submit))
         self._previous_shortcut_edit.setKeySequence(QKeySequence(snapshot.shortcuts.previous))
         self._next_shortcut_edit.setKeySequence(QKeySequence(snapshot.shortcuts.next))
@@ -491,6 +526,12 @@ class TaskCreationDialog(QDialog):
             combo.setCurrentIndex(index)
         elif combo.isEditable():
             combo.setCurrentText(value)
+
+    def _set_combo_data(self, combo: QComboBox, value: object) -> None:
+        for index in range(combo.count()):
+            if combo.itemData(index) == value:
+                combo.setCurrentIndex(index)
+                return
 
     def _set_browser_config(self, config_id: str) -> None:
         for index in range(self._browser_combo.count()):
@@ -595,6 +636,11 @@ class TaskCreationDialog(QDialog):
         manual_review_scope = self._scope_value(self._manual_scope_widget, "人工检查")
         export_scope = self._scope_value(self._export_scope_widget, "导出")
         enrichment_scope = self._scope_value(self._enrichment_scope_widget, "补充采集")
+        machine_screening_config = MachineScreeningConfig(
+            top_video_count=int(self._machine_top_video_spin.value()),
+            metric_type=str(self._machine_metric_combo.currentData()),
+            play_count_threshold=int(self._machine_threshold_spin.value()),
+        )
 
         return TaskSnapshot(
             sheet_name=sheet_name,
@@ -616,6 +662,7 @@ class TaskCreationDialog(QDialog):
             manual_review_scope=manual_review_scope,
             export_scope=export_scope,
             enrichment_scope=enrichment_scope,
+            machine_screening_config=machine_screening_config,
         )
 
     def _scope_value(self, widget: ScopeSelectionWidget, label: str) -> TaskRangeSelection:

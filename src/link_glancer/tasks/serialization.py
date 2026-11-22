@@ -3,6 +3,7 @@ from __future__ import annotations
 from link_glancer.tasks.models import (
     BrowserConfig,
     BrowserProfile,
+    MachineScreeningConfig,
     ReviewField,
     ReviewOption,
     ReviewShortcutConfig,
@@ -32,6 +33,11 @@ def task_snapshot_to_dict(snapshot: TaskSnapshot) -> dict[str, object]:
         "manual_review_scope": snapshot.manual_review_scope,
         "export_scope": snapshot.export_scope,
         "enrichment_scope": snapshot.enrichment_scope,
+        "machine_screening_config": {
+            "top_video_count": snapshot.machine_screening_config.top_video_count,
+            "metric_type": snapshot.machine_screening_config.metric_type,
+            "play_count_threshold": snapshot.machine_screening_config.play_count_threshold,
+        },
     }
 
 
@@ -63,6 +69,9 @@ def task_snapshot_from_dict(data: dict[str, object]) -> TaskSnapshot:
         manual_review_scope=normalize_task_range_selection(data.get("manual_review_scope")),
         export_scope=normalize_task_range_selection(data.get("export_scope")),
         enrichment_scope=normalize_task_range_selection(data.get("enrichment_scope")),
+        machine_screening_config=machine_screening_config_from_dict(
+            data.get("machine_screening_config")
+        ),
     )
 
 
@@ -140,6 +149,21 @@ def review_field_from_dict(data: dict[str, object]) -> ReviewField:
         screen_pass_value=str(data.get("screen_pass_value", "通过")),
         screen_fail_value=str(data.get("screen_fail_value", "不通过")),
         source=str(data.get("source", "manual")),  # type: ignore[arg-type]
+    )
+
+
+def machine_screening_config_from_dict(data: object) -> MachineScreeningConfig:
+    if not isinstance(data, dict):
+        return MachineScreeningConfig()
+    top_video_count = int(data.get("top_video_count", 10) or 10)
+    play_count_threshold = int(data.get("play_count_threshold", 1000) or 1000)
+    metric_type = str(data.get("metric_type", "avg"))
+    if metric_type not in {"sum", "avg", "median"}:
+        metric_type = "avg"
+    return MachineScreeningConfig(
+        top_video_count=max(top_video_count, 1),
+        metric_type=metric_type,  # type: ignore[arg-type]
+        play_count_threshold=max(play_count_threshold, 0),
     )
 
 

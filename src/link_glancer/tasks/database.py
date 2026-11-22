@@ -1429,6 +1429,14 @@ def _normalize_task_snapshot_payload(payload: dict[str, object]) -> dict[str, ob
     normalized.setdefault(
         "enrichment_scope", ["screen_passed", "screen_failed", "screen_unresolved"]
     )
+    normalized.setdefault(
+        "machine_screening_config",
+        {
+            "top_video_count": 10,
+            "metric_type": "avg",
+            "play_count_threshold": 1000,
+        },
+    )
     return normalized
 
 

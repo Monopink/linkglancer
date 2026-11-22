@@ -14,6 +14,7 @@ from link_glancer.tasks.database import (
 from link_glancer.tasks.export_fields import resolve_export_fields
 from link_glancer.tasks.models import MachineScreeningRecord, ReviewRecord, TaskItem, TaskSnapshot
 from link_glancer.tasks.screening import (
+    machine_remark_field,
     machine_screening_field,
     matches_screening_scope,
     screen_value_for_result,
@@ -175,6 +176,14 @@ def _merged_review_data(
         value = screen_value_for_result(field, machine_screening.result_code)
         if value is not None:
             merged[field.field_id] = value
+    remark_field = machine_remark_field(task_snapshot)
+    machine_note = str(machine_screening.details.get("machine_note") or "").strip()
+    if (
+        remark_field is not None
+        and machine_note
+        and not str(merged.get(remark_field.field_id) or "").strip()
+    ):
+        merged[remark_field.field_id] = machine_note
     return merged
 
 
